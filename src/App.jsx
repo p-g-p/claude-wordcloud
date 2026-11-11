@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import {
   Download, Send, Settings, ChevronDown, ChevronUp, Shield,
@@ -38,6 +38,93 @@ const SEED_SUBMISSIONS = SEED_WORDS.map((text, i) => ({
   is_admin: false,
   created_at: new Date(Date.now() - i * 1000).toISOString()
 }));
+
+const FONT_FAMILY = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+
+// Measure real text width with the same font the SVG uses, instead of guessing
+// a per-character width. Falls back to a generous estimate if canvas is missing.
+let measureCtx = null;
+const measureText = (text, size) => {
+  try {
+    if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d');
+    measureCtx.font = `600 ${size}px ${FONT_FAMILY}`;
+    return measureCtx.measureText(text).width;
+  } catch {
+    return text.length * size * 0.6;
+  }
+};
+
+const computeLayout = (wordData) => {
+  if (!wordData.length) return [];
+  const width = 800, height = 500, cx = width / 2, cy = height / 2, padding = 30;
+  const positions = [];
+  wordData.forEach((word) => {
+    const rotation = Math.random() > 0.8 ? Math.random() * 30 - 15 : 0;
+    const rad = (rotation * Math.PI) / 180;
+    const textWidth = measureText(word.text, word.size);
+    const textHeight = word.size * 1.0;
+    // Bounding box of the ROTATED text, so tilted words reserve the space they really use
+    const boxW = textWidth * Math.abs(Math.cos(rad)) + textHeight * Math.abs(Math.sin(rad));
+    const boxH = textWidth * Math.abs(Math.sin(rad)) + textHeight * Math.abs(Math.cos(rad));
+    let angle = 0, radius = 0, attempts = 0;
+    while (attempts < 2000) {
+      attempts++;
+      const x = cx + radius * 1.6 * Math.cos(angle);
+      const y = cy + radius * Math.sin(angle);
+      angle += 0.3; radius += 0.12;
+      if (x - boxW / 2 < padding || x + boxW / 2 > width - padding ||
+          y - boxH / 2 < padding || y + boxH / 2 > height - padding) continue;
+      const collision = positions.some((p) =>
+        Math.abs(x - p.x) < (boxW + p.boxW) / 2 + 6 &&
+        Math.abs(y - p.y) < (boxH + p.boxH) / 2 + 4
+      );
+      if (!collision) {
+        positions.push({ ...word, x, y, boxW, boxH, rotation });
+        break;
+      }
+    }
+  });
+  return positions;
+};
+
+// Defined at module scope (not inside App) so React keeps the same component
+// between renders. Otherwise every keystroke remounted the SVG and restarted animations.
+function WordCloudSVG({ reference, layoutData, previousWordData, animateWords }) {
+  const isNew = (text) => !previousWordData.some((w) => w.text === text);
+  return (
+    <svg ref={reference} width="800" height="500" className="w-full bg-white"
+         viewBox="0 0 800 500" preserveAspectRatio="xMidYMid meet">
+      <defs>
+        <filter id="glow">
+          <feGaussianBlur stdDeviation="3" result="b" />
+          <feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge>
+        </filter>
+        <style>{`
+          @keyframes fadeIn { from { opacity:0; transform:scale(0.5);} to { opacity:1; transform:scale(1);} }
+          @keyframes pulse { 0%,100% { opacity:1;} 50% { opacity:0.7;} }
+          .word-new { animation: fadeIn 0.6s ease-out; filter:url(#glow); }
+          .word-static { animation: pulse 2s ease-in-out infinite; }
+        `}</style>
+      </defs>
+      <rect width="800" height="500" fill="white" />
+      {layoutData.map((word, i) => {
+        const fresh = animateWords && isNew(word.text);
+        return (
+          <g key={`${word.text}-${i}`} className={fresh ? 'word-new' : 'word-static'}>
+            <text x={word.x} y={word.y} fontSize={word.size} fill={word.color}
+                  textAnchor="middle" dominantBaseline="middle"
+                  transform={`rotate(${word.rotation}, ${word.x}, ${word.y})`}
+                  fontFamily={FONT_FAMILY}
+                  fontWeight="600" style={{ transformOrigin: `${word.x}px ${word.y}px` }}>
+              {word.text}
+            </text>
+            <title>{word.frequency} submission{word.frequency > 1 ? 's' : ''}</title>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
 
 export default function App() {
   const [submissions, setSubmissions] = useState([]);
@@ -177,40 +264,8 @@ export default function App() {
     await supabase.auth.signOut();
   };
 
-  const generateLayout = useCallback(() => {
-    if (!wordData.length) return [];
-    const width = 800, height = 500, cx = width / 2, cy = height / 2, padding = 50;
-    const positions = [];
-    wordData.forEach((word) => {
-      let angle = 0, radius = 0, positioned = false, attempts = 0;
-      while (!positioned && attempts < 1000) {
-        const x = cx + radius * Math.cos(angle);
-        const y = cy + radius * Math.sin(angle);
-        const textWidth = word.text.length * word.size * 0.5;
-        const textHeight = word.size * 0.8;
-        if (x - textWidth / 2 < padding || x + textWidth / 2 > width - padding ||
-            y - textHeight / 2 < padding || y + textHeight / 2 > height - padding) {
-          angle += 0.3; radius += 0.3; attempts++; continue;
-        }
-        let collision = false;
-        for (const p of positions) {
-          const dx = Math.abs(x - p.x), dy = Math.abs(y - p.y);
-          if (dx < (textWidth + p.width) / 2 + 8 && dy < (textHeight + p.height) / 2 + 4) {
-            collision = true; break;
-          }
-        }
-        if (!collision) {
-          positions.push({ ...word, x, y, width: textWidth, height: textHeight,
-            rotation: Math.random() > 0.8 ? Math.random() * 30 - 15 : 0 });
-          positioned = true;
-        } else { angle += 0.3; radius += 0.3; }
-        attempts++;
-      }
-    });
-    return positions;
-  }, [wordData]);
-
-  const layoutData = generateLayout();
+  // Computed once per word-set change, so typing in the input no longer re-rolls rotations
+  const layoutData = useMemo(() => computeLayout(wordData), [wordData]);
 
   const downloadSVG = () => {
     if (!svgRef.current) return;
@@ -228,43 +283,6 @@ export default function App() {
     setTimeout(() => URL.revokeObjectURL(url), 100);
   };
 
-  const WordCloudSVG = ({ reference }) => {
-    const isNew = (text) => !previousWordData.some((w) => w.text === text);
-    return (
-      <svg ref={reference} width="800" height="500" className="w-full bg-white"
-           viewBox="0 0 800 500" preserveAspectRatio="xMidYMid meet">
-        <defs>
-          <filter id="glow">
-            <feGaussianBlur stdDeviation="3" result="b" />
-            <feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge>
-          </filter>
-          <style>{`
-            @keyframes fadeIn { from { opacity:0; transform:scale(0.5);} to { opacity:1; transform:scale(1);} }
-            @keyframes pulse { 0%,100% { opacity:1;} 50% { opacity:0.7;} }
-            .word-new { animation: fadeIn 0.6s ease-out; filter:url(#glow); }
-            .word-static { animation: pulse 2s ease-in-out infinite; }
-          `}</style>
-        </defs>
-        <rect width="800" height="500" fill="white" />
-        {layoutData.map((word, i) => {
-          const fresh = animateWords && isNew(word.text);
-          return (
-            <g key={`${word.text}-${i}`} className={fresh ? 'word-new' : 'word-static'}>
-              <text x={word.x} y={word.y} fontSize={word.size} fill={word.color}
-                    textAnchor="middle" dominantBaseline="middle"
-                    transform={`rotate(${word.rotation}, ${word.x}, ${word.y})`}
-                    fontFamily="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
-                    fontWeight="600" style={{ transformOrigin: `${word.x}px ${word.y}px` }}>
-                {word.text}
-              </text>
-              <title>{word.frequency} submission{word.frequency > 1 ? 's' : ''}</title>
-            </g>
-          );
-        })}
-      </svg>
-    );
-  };
-
   if (showCloudOnly) {
     return (
       <div className="min-h-screen w-full bg-white flex items-center justify-center p-8">
@@ -278,7 +296,7 @@ export default function App() {
               <Send size={48} className="mx-auto mb-4 text-gray-300" />
               <p className="text-xl">Submit words to create the cloud</p>
             </div>
-          ) : <WordCloudSVG reference={svgRef} />}
+          ) : <WordCloudSVG reference={svgRef} layoutData={layoutData} previousWordData={previousWordData} animateWords={animateWords} />}
         </div>
       </div>
     );
@@ -453,7 +471,7 @@ export default function App() {
                     <Send size={32} className="mx-auto mb-3 text-gray-300" />
                     <p className="text-sm">Submit words to create the cloud</p>
                   </div>
-                ) : <WordCloudSVG reference={svgRef} />}
+                ) : <WordCloudSVG reference={svgRef} layoutData={layoutData} previousWordData={previousWordData} animateWords={animateWords} />}
               </div>
             </div>
           </div>

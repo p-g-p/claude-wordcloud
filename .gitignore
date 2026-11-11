@@ -8,3 +8,6 @@ dist-ssr
 !.env.example
 
 .DS_Store
+
+# Original build spec (superseded by the repo)
+wordcloud-handoff.md
